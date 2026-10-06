@@ -28,6 +28,9 @@
 .PARAMETER BaselineCsv
     CSV produced by a previous run on a known-good network (hotspot). Results are compared against it.
 
+.PARAMETER ShowAll
+    List every endpoint on screen. By default only problems are listed, with a pass count per category.
+
 .PARAMETER TimeoutMs
     Per-step timeout in milliseconds. Default 5000.
 
@@ -48,8 +51,16 @@ param(
     [string]$OutputPath,
     [string]$BaselineCsv,
     [int]$TimeoutMs = 5000,
-    [int]$Throttle = 16
+    [int]$Throttle = 16,
+    [switch]$ShowAll
 )
+
+# OOBE's console keeps little scrollback - enlarge it so nothing scrolls away
+try {
+    $raw = $Host.UI.RawUI
+    $bs = $raw.BufferSize
+    if ($bs.Height -lt 3000) { $bs.Height = 3000; $raw.BufferSize = $bs }
+} catch { }
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'Continue'
@@ -542,8 +553,16 @@ foreach ($r in $results) {
 
 #region Output
 foreach ($grp in ($results | Group-Object Category)) {
-    Write-Section $grp.Name
+    $okCount = @($grp.Group | Where-Object { $_.Result -eq 'PASS' }).Count
+    if (-not $ShowAll) {
+        $color = if ($okCount -eq $grp.Count) { 'Green' } elseif (@($grp.Group | Where-Object { $_.Result -eq 'FAIL' })) { 'Red' } else { 'Yellow' }
+        Write-Host ''
+        Write-Host (' {0,-40} {1,2} / {2,-2} OK' -f $grp.Name, $okCount, $grp.Count) -ForegroundColor $color
+    } else {
+        Write-Section $grp.Name
+    }
     foreach ($r in $grp.Group) {
+        if (-not $ShowAll) { continue }   # problems are listed once, in the final summary
         $label = '{0}://{1}:{2}' -f $r.Scheme, $r.HostName, $r.Port
         if ($label.Length -gt 52) { $label = $label.Substring(0, 49) + '...' }
         $info = @()
@@ -563,17 +582,6 @@ $fails = @($all | Where-Object { $_.Result -eq 'FAIL' })
 $warns = @($all | Where-Object { $_.Result -eq 'WARN' })
 $passes = @($all | Where-Object { $_.Result -eq 'PASS' })
 
-Write-Section 'Summary'
-Write-Host ("  PASS: {0}   WARN: {1}   FAIL: {2}   (took {3:N0}s)" -f $passes.Count, $warns.Count, $fails.Count, ((Get-Date) - $start).TotalSeconds)
-Write-Host ''
-
-$critFails = @($fails | Where-Object { $_.Level -eq 'Critical' })
-if ($critFails) {
-    Write-Host '  CRITICAL failures (these alone will cause "Sorry, you''ve lost connection" or block sign-in):' -ForegroundColor Red
-    $critFails | ForEach-Object { Write-Host "    - $($_.HostName)  $($_.Detail)" -ForegroundColor Red }
-    Write-Host ''
-}
-
 # Diagnosis hints
 $hints = New-Object System.Collections.Generic.List[string]
 if ($all | Where-Object { $_.Category -like 'NCSI*' -or $_.HostName -like '*NCSI*' } | Where-Object { $_.Result -eq 'FAIL' }) {
@@ -592,17 +600,7 @@ if ($results | Where-Object { $_.TCP -eq 'FAIL' }) {
 if ($results | Where-Object { $_.Detail -match 'Redirected to|block page|captive portal' }) {
     $hints.Add('Requests are being redirected / served a block page. Common cause: the filter applies a "not logged in / unauthenticated" policy to unknown devices. New devices in OOBE cannot authenticate to the filter, so the domains below must be allowed for unauthenticated users (or the onboarding SSID/VLAN must bypass authentication).')
 }
-if ($hints.Count) {
-    Write-Host '  Diagnosis:' -ForegroundColor Yellow
-    $hints | ForEach-Object { Write-Host "    * $_" -ForegroundColor Yellow }
-    Write-Host ''
-}
-if (-not $fails) {
-    Write-Host '  No hard failures from this device. If OOBE still fails, run this script FROM OOBE (Shift+F10) on the new device:' -ForegroundColor Green
-    Write-Host '  a managed device may trust the filter CA or be identified by user/device policy that a new device is not.' -ForegroundColor Green
-}
-
-# Save files
+# Save files (quietly - the terminal output below is the main report)
 if (-not $OutputPath) { $OutputPath = if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP } }
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
 $tag = if ($ssid) { $ssid -replace '[^\w\-]', '_' } else { 'wired' }
@@ -638,12 +636,58 @@ $report += ($RecommendedAllowList | ForEach-Object { "  $_" })
 $report += ''
 $report += 'Reference: https://learn.microsoft.com/autopilot/requirements?tabs=networking'
 $report += '           https://learn.microsoft.com/intune/intune-service/fundamentals/intune-endpoints'
-$report | Set-Content -Path $txt -Encoding UTF8
+try { $report | Set-Content -Path $txt -Encoding UTF8 -ErrorAction Stop } catch { $txt = $null }
 
-Write-Host ''
-Write-Host "  Report  : $csv" -ForegroundColor Cyan
-Write-Host "  For filter admin: $txt" -ForegroundColor Cyan
-if (-not $BaselineCsv) {
-    Write-Host '  Tip: run this on the hotspot too, then re-run on school Wi-Fi with -BaselineCsv <hotspot csv> to highlight differences.' -ForegroundColor DarkGray
+# ---------- Final on-screen summary: everything needed without scrolling ----------
+Write-Section ("RESULT on '{0}':  PASS {1}   WARN {2}   FAIL {3}" -f $(if ($ssid) { $ssid } else { 'wired' }), $passes.Count, $warns.Count, $fails.Count)
+
+$rank = @{ Critical = 0; Required = 1; Recommended = 2 }
+if ($fails) {
+    Write-Host ' FAILED (most important first):' -ForegroundColor Red
+    foreach ($p in ($fails | Sort-Object { $rank[$_.Level] })) {
+        $what = if ($p.Port) { '{0}:{1}' -f $p.HostName, $p.Port } else { $p.HostName }
+        $tagTxt = if ($p.Baseline -eq 'PASS') { ' [works on baseline]' } else { '' }
+        Write-Host (' {0,-8} {1}{2}' -f $p.Level, $what, $tagTxt) -ForegroundColor Red -NoNewline
+        Write-Host " - $($p.Detail)" -ForegroundColor DarkGray
+    }
+    Write-Host ''
 }
+if ($warns) {
+    Write-Host ' WARNINGS (non-critical):' -ForegroundColor Yellow
+    if ($warns.Count -le 5 -or $ShowAll) {
+        foreach ($p in $warns) {
+            Write-Host " $($p.HostName):$($p.Port)" -ForegroundColor Yellow -NoNewline
+            Write-Host " - $($p.Detail)" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host (' ' + (($warns | ForEach-Object { $_.HostName }) -join ', ')) -ForegroundColor Yellow
+        Write-Host ' (same kind of failure as above - run with -ShowAll for details)' -ForegroundColor DarkGray
+    }
+    Write-Host ''
+}
+
+if ($hints.Count) {
+    Write-Host ' Diagnosis:' -ForegroundColor Yellow
+    $hints | ForEach-Object { Write-Host "  * $_" -ForegroundColor Yellow }
+    Write-Host ''
+}
+
+$critFails = @($fails | Where-Object { $_.Level -eq 'Critical' })
+if ($critFails) {
+    Write-Host ' VERDICT: Critical endpoints are blocked - this network WILL break OOBE ("Sorry, you''ve lost connection").' -ForegroundColor Red
+} elseif ($fails) {
+    Write-Host ' VERDICT: OOBE may get past the network screen, but Autopilot / enrolment / activation will fail or stall.' -ForegroundColor Red
+} elseif ($warns) {
+    Write-Host ' VERDICT: Nothing critical blocked. Warnings only affect later steps (apps, updates, branding).' -ForegroundColor Yellow
+} else {
+    Write-Host ' VERDICT: Everything Microsoft needs is reachable from this device on this network.' -ForegroundColor Green
+    Write-Host '          If OOBE still fails, run this on the NEW device from OOBE (Shift+F10) - a managed device' -ForegroundColor Green
+    Write-Host '          may trust the filter CA or get a different filter policy than an unknown device.' -ForegroundColor Green
+}
+Write-Host ''
+Write-Host " Saved: $csv" -ForegroundColor DarkGray
+if (-not $BaselineCsv) {
+    Write-Host " Compare with another network: re-run with  -BaselineCsv `"$csv`"" -ForegroundColor DarkGray
+}
+if (-not $ShowAll) { Write-Host ' Add -ShowAll to list every endpoint (incl. passing ones).' -ForegroundColor DarkGray }
 #endregion
